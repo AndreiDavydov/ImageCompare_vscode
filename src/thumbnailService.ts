@@ -3,7 +3,12 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import * as zlib from 'zlib';
 import { getSharp, getSharpError } from './sharpLoader';
-import { parsePpmx } from './ppmxParser';
+import { parsePpmx, PpmxColormap } from './ppmxParser';
+
+interface PpmxOrientationHint {
+  width: number;
+  height: number;
+}
 
 /**
  * Inject a PNG tEXt chunk into a PNG buffer (before IEND).
@@ -125,25 +130,29 @@ export class ThumbnailService {
   private createSharpInstance(
     sharp: NonNullable<ReturnType<typeof getSharp>>,
     buffer: Buffer,
-    ext: string
+    ext: string,
+    ppmxColormap: PpmxColormap = 'grayscale',
+    orientationHint?: PpmxOrientationHint
   ) {
     if (ext === '.ppmx') {
-      const ppmx = parsePpmx(buffer);
+      const ppmx = parsePpmx(buffer, { colormap: ppmxColormap, orientationHint });
       return sharp(ppmx.rgbBuffer, {
         raw: { width: ppmx.width, height: ppmx.height, channels: 3 }
       });
     }
-    return sharp(buffer);
+    return sharp(buffer).rotate();
   }
 
   /** Create a Jimp instance, handling PPMX raw data. */
   private async createJimpImage(
     Jimp: any,
     buffer: Buffer,
-    ext: string
+    ext: string,
+    ppmxColormap: PpmxColormap = 'grayscale',
+    orientationHint?: PpmxOrientationHint
   ): Promise<any> {
     if (ext === '.ppmx') {
-      const ppmx = parsePpmx(buffer);
+      const ppmx = parsePpmx(buffer, { colormap: ppmxColormap, orientationHint });
       const rgbaBuffer = Buffer.alloc(ppmx.width * ppmx.height * 4);
       for (let i = 0; i < ppmx.width * ppmx.height; i++) {
         rgbaBuffer[i * 4] = ppmx.rgbBuffer[i * 3];
@@ -164,17 +173,26 @@ export class ThumbnailService {
   // Cache
   // ---------------------------------------------------------------------------
 
-  private getCacheKey(uri: vscode.Uri, mtime: number): string {
+  private getCacheKey(uri: vscode.Uri, mtime: number, variant: string = ''): string {
     const hash = crypto.createHash('sha256');
     hash.update(uri.toString());
     hash.update(mtime.toString());
+    hash.update(variant);
     return hash.digest('hex').substring(0, 16);
   }
 
-  async getThumbnail(uri: vscode.Uri, size: number): Promise<string> {
+  async getThumbnail(
+    uri: vscode.Uri,
+    size: number,
+    ppmxColormap: PpmxColormap = 'grayscale',
+    orientationHint?: PpmxOrientationHint
+  ): Promise<string> {
     try {
       const stat = await vscode.workspace.fs.stat(uri);
-      const cacheKey = this.getCacheKey(uri, stat.mtime);
+      const ext = path.extname(uri.path).toLowerCase();
+      const orientationVariant = orientationHint ? `${orientationHint.width}x${orientationHint.height}` : 'none';
+      const variant = ext === '.ppmx' ? `ppmx:${ppmxColormap}:${orientationVariant}` : '';
+      const cacheKey = this.getCacheKey(uri, stat.mtime, variant);
 
       // Check memory cache first
       if (this.memoryCache.has(cacheKey)) {
@@ -189,7 +207,7 @@ export class ThumbnailService {
       }
 
       // Generate new thumbnail
-      const dataUrl = await this.generateThumbnail(uri, size);
+      const dataUrl = await this.generateThumbnail(uri, size, ppmxColormap, orientationHint);
 
       // Cache it
       this.memoryCache.set(cacheKey, dataUrl);
@@ -206,14 +224,19 @@ export class ThumbnailService {
   // Thumbnail generation
   // ---------------------------------------------------------------------------
 
-  private async generateThumbnail(uri: vscode.Uri, size: number): Promise<string> {
+  private async generateThumbnail(
+    uri: vscode.Uri,
+    size: number,
+    ppmxColormap: PpmxColormap,
+    orientationHint?: PpmxOrientationHint
+  ): Promise<string> {
     const fileData = await vscode.workspace.fs.readFile(uri);
     const buffer = Buffer.from(fileData);
     const ext = path.extname(uri.path).toLowerCase();
 
     const sharp = getSharp();
     if (sharp) {
-      const inst = this.createSharpInstance(sharp, buffer, ext);
+      const inst = this.createSharpInstance(sharp, buffer, ext, ppmxColormap, orientationHint);
       const thumbnailBuffer = await inst
         .resize(size, size, { fit: 'inside' })
         .jpeg({ quality: 70 })
@@ -225,7 +248,7 @@ export class ThumbnailService {
     if (!Jimp) {
       throw new Error('No image processing backend available (Sharp and Jimp both failed)');
     }
-    const image = await this.createJimpImage(Jimp, buffer, ext);
+    const image = await this.createJimpImage(Jimp, buffer, ext, ppmxColormap, orientationHint);
     image.scaleToFit({ w: size, h: size });
     const jpegBuffer: Buffer = await image.getBuffer('image/jpeg', { quality: 70 });
     return `data:image/jpeg;base64,${jpegBuffer.toString('base64')}`;
@@ -235,14 +258,18 @@ export class ThumbnailService {
   // Full image loading
   // ---------------------------------------------------------------------------
 
-  async loadFullImage(uri: vscode.Uri): Promise<{ dataUrl: string; width: number; height: number }> {
+  async loadFullImage(
+    uri: vscode.Uri,
+    ppmxColormap: PpmxColormap = 'grayscale',
+    orientationHint?: PpmxOrientationHint
+  ): Promise<{ dataUrl: string; width: number; height: number }> {
     const fileData = await vscode.workspace.fs.readFile(uri);
     const buffer = Buffer.from(fileData);
     const ext = path.extname(uri.path).toLowerCase();
 
     const sharp = getSharp();
     if (sharp) {
-      const inst = this.createSharpInstance(sharp, buffer, ext);
+      const inst = this.createSharpInstance(sharp, buffer, ext, ppmxColormap, orientationHint);
       const metadata = await inst.metadata();
       const width = metadata.width || 0;
       const height = metadata.height || 0;
@@ -254,7 +281,7 @@ export class ThumbnailService {
     if (!Jimp) {
       throw new Error('No image processing backend available (Sharp and Jimp both failed)');
     }
-    const image = await this.createJimpImage(Jimp, buffer, ext);
+    const image = await this.createJimpImage(Jimp, buffer, ext, ppmxColormap, orientationHint);
     const pngBuffer: Buffer = await image.getBuffer('image/png');
     return {
       dataUrl: `data:image/png;base64,${pngBuffer.toString('base64')}`,
@@ -267,14 +294,14 @@ export class ThumbnailService {
   // Image metadata
   // ---------------------------------------------------------------------------
 
-  async getImageDimensions(uri: vscode.Uri): Promise<{ width: number; height: number }> {
+  async getImageDimensions(uri: vscode.Uri, orientationHint?: PpmxOrientationHint): Promise<{ width: number; height: number }> {
     const fileData = await vscode.workspace.fs.readFile(uri);
     const buffer = Buffer.from(fileData);
     const ext = path.extname(uri.path).toLowerCase();
 
     const sharp = getSharp();
     if (sharp) {
-      const meta = await this.createSharpInstance(sharp, buffer, ext).metadata();
+      const meta = await this.createSharpInstance(sharp, buffer, ext, 'grayscale', orientationHint).metadata();
       return { width: meta.width || 0, height: meta.height || 0 };
     }
 
@@ -282,7 +309,7 @@ export class ThumbnailService {
     if (!Jimp) {
       throw new Error('No image processing backend available');
     }
-    const image = await this.createJimpImage(Jimp, buffer, ext);
+    const image = await this.createJimpImage(Jimp, buffer, ext, 'grayscale', orientationHint);
     return { width: image.width, height: image.height };
   }
 
@@ -294,7 +321,9 @@ export class ThumbnailService {
     uri: vscode.Uri,
     rect: { x: number; y: number; w: number; h: number },
     sourceWidth: number,
-    sourceHeight: number
+    sourceHeight: number,
+    ppmxColormap: PpmxColormap = 'grayscale',
+    orientationHint?: PpmxOrientationHint
   ): Promise<Buffer> {
     const fileData = await vscode.workspace.fs.readFile(uri);
     const buffer = Buffer.from(fileData);
@@ -305,7 +334,7 @@ export class ThumbnailService {
 
     const sharp = getSharp();
     if (sharp) {
-      const pngBuf = await this.createSharpInstance(sharp, buffer, ext)
+      const pngBuf = await this.createSharpInstance(sharp, buffer, ext, ppmxColormap, orientationHint)
         .extract({ left: rect.x, top: rect.y, width: rect.w, height: rect.h })
         .png({ compressionLevel: 6 })
         .withMetadata({
@@ -322,7 +351,7 @@ export class ThumbnailService {
     if (!Jimp) {
       throw new Error('No image processing backend available (Sharp and Jimp both failed)');
     }
-    const image = await this.createJimpImage(Jimp, buffer, ext);
+    const image = await this.createJimpImage(Jimp, buffer, ext, ppmxColormap, orientationHint);
     image.crop({ x: rect.x, y: rect.y, w: rect.w, h: rect.h });
     const pngBuf: Buffer = await image.getBuffer('image/png');
     return pngInjectText(pngBuf, 'ImageCompare:CropRect', cropMeta);
@@ -392,8 +421,9 @@ export class ThumbnailService {
   // ---------------------------------------------------------------------------
 
   queueThumbnails(
-    items: Array<{ uri: vscode.Uri; tupleIndex: number; modalityIndex: number }>,
+    items: Array<{ uri: vscode.Uri; tupleIndex: number; modalityIndex: number; orientationHint?: PpmxOrientationHint }>,
     size: number,
+    ppmxColormap: PpmxColormap,
     onComplete: (tupleIndex: number, modalityIndex: number, dataUrl: string) => void,
     onError: (tupleIndex: number, modalityIndex: number, error: string) => void,
     onProgress: (current: number, total: number) => void
@@ -402,7 +432,7 @@ export class ThumbnailService {
     const total = items.length;
 
     for (const item of items) {
-      this.getThumbnail(item.uri, size)
+      this.getThumbnail(item.uri, size, ppmxColormap, item.orientationHint)
         .then(dataUrl => {
           completed++;
           onComplete(item.tupleIndex, item.modalityIndex, dataUrl);

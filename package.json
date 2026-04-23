@@ -79,6 +79,15 @@
           "type": "boolean",
           "default": false,
           "description": "Enable debug logging (file watcher events, polling, etc.) in the webview developer console"
+        },
+        "imageCompare.ppmxColormap": {
+          "type": "string",
+          "default": "grayscale",
+          "enum": [
+            "grayscale",
+            "jet"
+          ],
+          "description": "Default colormap for PPMX files"
         }
       }
     }
@@ -96,6 +105,7 @@
     "@types/vscode": "^1.85.0",
     "@typescript-eslint/eslint-plugin": "^6.13.0",
     "@typescript-eslint/parser": "^6.13.0",
+    "@vscode/vsce": "^3.9.1",
     "eslint": "^8.54.0",
     "ts-loader": "^9.5.1",
     "typescript": "^5.3.2",
