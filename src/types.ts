@@ -50,11 +50,15 @@ export interface WinnerResults {
   winners: Map<string, string>; // tupleKey -> modality name
 }
 
+export type PpmxColormap = 'grayscale' | 'jet';
+
 // Messages from WebView to Extension
 export type WebViewMessage =
   | { type: 'ready' }
   | { type: 'requestThumbnails'; tupleIndices: number[] }
   | { type: 'requestImage'; tupleIndex: number; modalityIndex: number }
+  | { type: 'requestPixelValue'; tupleIndex: number; modalityIndex: number; x: number; y: number; requestId: number }
+  | { type: 'requestPpmxRaw'; tupleIndex: number; modalityIndex: number; requestId: number }
   | { type: 'navigateTo'; tupleIndex: number }
   | { type: 'setCurrentTuple'; tupleIndex: number }
   | { type: 'tupleFullyLoaded'; tupleIndex: number }
@@ -62,15 +66,18 @@ export type WebViewMessage =
   | { type: 'cropImages'; tupleIndex: number; cropRect: { x: number; y: number; w: number; h: number }; srcWidth: number; srcHeight: number }
   | { type: 'deleteTuple'; tupleIndex: number }
   | { type: 'exportPptx'; tupleIndices: number[]; winnerModalityIndices: (number | null)[]; modalityOrder: number[] }
+  | { type: 'setPpmxColormap'; colormap: PpmxColormap }
   | { type: 'log'; message: string };
 
 // Messages from Extension to WebView
 export type ExtensionMessage =
-  | { type: 'init'; tuples: TupleInfo[]; modalities: string[]; modalityPaths: string[]; config: WebViewConfig; winners: Record<number, number>; votingEnabled: boolean }
+  | { type: 'init'; tuples: TupleInfo[]; modalities: string[]; modalityPaths: string[]; config: WebViewConfig; winners: Record<number, number>; votingEnabled: boolean; ppmxColormap: PpmxColormap }
   | { type: 'thumbnail'; tupleIndex: number; modalityIndex: number; dataUrl: string }
   | { type: 'thumbnailError'; tupleIndex: number; modalityIndex: number; error: string }
-  | { type: 'image'; tupleIndex: number; modalityIndex: number; dataUrl: string; width: number; height: number }
+  | { type: 'image'; tupleIndex: number; modalityIndex: number; dataUrl: string; width: number; height: number; isPpmx?: boolean }
   | { type: 'imageError'; tupleIndex: number; modalityIndex: number; error: string }
+  | { type: 'ppmxRawData'; tupleIndex: number; modalityIndex: number; requestId: number; width: number; height: number; valuesBase64: string }
+  | { type: 'pixelValue'; tupleIndex: number; modalityIndex: number; x: number; y: number; requestId: number; value: number | null }
   | { type: 'thumbnailProgress'; current: number; total: number }
   | { type: 'fileDeleted'; tupleIndex: number; modalityIndex: number }
   | { type: 'fileRestored'; tupleIndex: number; modalityIndex: number; imageInfo?: ImageInfo }

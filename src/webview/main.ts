@@ -38,6 +38,7 @@ interface LoadedImage {
   modality: string;
   width: number;
   height: number;
+  isPpmx?: boolean;
 }
 
 // Modality colors
@@ -61,6 +62,8 @@ const fpCollapseBtn = document.getElementById('fp-collapse-btn')!;
 const cropBtn = document.getElementById('crop-btn')!;
 const deleteBtn = document.getElementById('delete-btn')!;
 const pptxBtn = document.getElementById('pptx-btn')!;
+const showZoomToggleEl = document.getElementById('show-zoom-toggle') as HTMLInputElement;
+const ppmxColormapSelectEl = document.getElementById('ppmx-colormap-select') as HTMLSelectElement;
 const thumbCanvasEl = document.getElementById('thumb-canvas') as HTMLCanvasElement;
 const thumbCtx = thumbCanvasEl.getContext('2d')!;
 const thumbViewportEl = document.getElementById('thumb-viewport')!;
@@ -134,6 +137,60 @@ const LOAD_DEBOUNCE_MS = 150; // wait this long before loading full images
 // Winner voting state
 let winners: Map<number, number> = new Map(); // tupleIndex -> modalityIndex (display index)
 let votingEnabled = false;
+let showZoomInStatus = true;
+let ppmxColormap: 'grayscale' | 'jet' = 'grayscale';
+
+// Status line composition state
+let baseStatusInfo = '';
+let pointerStatusInfo = '';
+
+// PPMX live value request state
+let latestPixelValueRequestId = 0;
+let activePpmxPixelKey: string | null = null;
+let activePpmxTupleIndex = -1;
+let activePpmxOriginalModalityIndex = -1;
+let activePpmxX = -1;
+let activePpmxY = -1;
+let latestPpmxRawRequestId = 0;
+
+interface PpmxRawCacheEntry {
+  width: number;
+  height: number;
+  values: Float32Array;
+}
+
+const MAX_PPMX_RAW_CACHE_ENTRIES = 3;
+const ppmxRawCache: Map<string, PpmxRawCacheEntry> = new Map();
+const ppmxRawPending: Map<string, number> = new Map();
+
+function clearPpmxRawCache(): void {
+  ppmxRawCache.clear();
+  ppmxRawPending.clear();
+  activePpmxPixelKey = null;
+}
+
+function getPpmxRawCacheEntry(cacheKey: string): PpmxRawCacheEntry | undefined {
+  const entry = ppmxRawCache.get(cacheKey);
+  if (!entry) return undefined;
+  // LRU touch: move to the end (most recently used)
+  ppmxRawCache.delete(cacheKey);
+  ppmxRawCache.set(cacheKey, entry);
+  return entry;
+}
+
+function setPpmxRawCacheEntry(cacheKey: string, entry: PpmxRawCacheEntry): void {
+  if (ppmxRawCache.has(cacheKey)) {
+    ppmxRawCache.delete(cacheKey);
+  }
+  ppmxRawCache.set(cacheKey, entry);
+
+  while (ppmxRawCache.size > MAX_PPMX_RAW_CACHE_ENTRIES) {
+    const oldestKey = ppmxRawCache.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    ppmxRawCache.delete(oldestKey);
+    ppmxRawPending.delete(oldestKey);
+  }
+}
 
 // Floating panel drag state
 let fpDragging = false;
@@ -149,7 +206,28 @@ function updateStatus(name: string, info: string, tupleIndex?: number) {
     prefix = `[${tupleIndex + 1}/${tuples.length}] `;
   }
   statusNameEl.textContent = prefix + name;
-  statusInfoEl.textContent = info;
+  baseStatusInfo = info;
+  refreshStatusInfo();
+}
+
+function refreshStatusInfo() {
+  if (baseStatusInfo && pointerStatusInfo) {
+    statusInfoEl.textContent = `${baseStatusInfo} | ${pointerStatusInfo}`;
+    return;
+  }
+  statusInfoEl.textContent = pointerStatusInfo || baseStatusInfo;
+}
+
+function setPointerStatusInfo(text: string) {
+  pointerStatusInfo = text;
+  if (!text) {
+    activePpmxPixelKey = null;
+  }
+  refreshStatusInfo();
+}
+
+function currentZoomInfo(): string {
+  return showZoomInStatus ? `Zoom: ${zoom.toFixed(1)}x` : '';
 }
 
 // Initialize
@@ -185,6 +263,7 @@ function setupEventListeners() {
   viewerEl.addEventListener('mousedown', handleMouseDown);
   document.addEventListener('mousemove', handleMouseMove);
   document.addEventListener('mouseup', handleMouseUp);
+  viewerEl.addEventListener('mouseleave', () => setPointerStatusInfo(''));
 
   // Carousel scroll + autohide scrollbar
   carouselEl.addEventListener('wheel', handleCarouselWheel, { passive: false });
@@ -270,6 +349,30 @@ function setupEventListeners() {
     }
     vscode.postMessage({ type: 'exportPptx', tupleIndices, winnerModalityIndices, modalityOrder });
   });
+
+  showZoomToggleEl.addEventListener('change', () => {
+    showZoomInStatus = showZoomToggleEl.checked;
+    if (images.length) {
+      render();
+    } else {
+      refreshStatusInfo();
+    }
+  });
+
+  ppmxColormapSelectEl.addEventListener('change', () => {
+    ppmxColormap = ppmxColormapSelectEl.value as 'grayscale' | 'jet';
+    vscode.postMessage({ type: 'setPpmxColormap', colormap: ppmxColormap });
+    // Clear all cached images so they are re-fetched with new colormap
+    loadedTuples.clear();
+    thumbnailDataUrls.clear();
+    images = [];
+    clearPpmxRawCache();
+    vscode.postMessage({
+      type: 'requestThumbnails',
+      tupleIndices: Array.from({ length: tuples.length }, (_, i) => i)
+    });
+    loadTuple(currentTupleIndex);
+  });
 }
 
 // Crop confirmation callback
@@ -322,6 +425,12 @@ window.addEventListener('message', (event) => {
       break;
     case 'imageError':
       handleImageError(message);
+      break;
+    case 'pixelValue':
+      handlePixelValue(message);
+      break;
+    case 'ppmxRawData':
+      handlePpmxRawData(message);
       break;
     case 'thumbnailProgress':
       handleProgress(message);
@@ -397,7 +506,7 @@ function handleWinnersReset(message: { winners: Record<number, number> }) {
   updateModalitySelector();
 }
 
-function handleInit(message: { tuples: TupleInfo[]; modalities: string[]; modalityPaths: string[]; config: WebViewConfig; winners: Record<number, number>; votingEnabled: boolean }) {
+function handleInit(message: { tuples: TupleInfo[]; modalities: string[]; modalityPaths: string[]; config: WebViewConfig; winners: Record<number, number>; votingEnabled: boolean; ppmxColormap: 'grayscale' | 'jet' }) {
   // Reset all state for new comparison
   tuples = message.tuples;
   modalities = message.modalities;
@@ -419,6 +528,18 @@ function handleInit(message: { tuples: TupleInfo[]; modalities: string[]; modali
   currentTupleIndex = 0;
   currentModalityIndex = 0;
   previousModalityIndex = 0;
+  latestPixelValueRequestId = 0;
+  activePpmxPixelKey = null;
+  activePpmxTupleIndex = -1;
+  activePpmxOriginalModalityIndex = -1;
+  activePpmxX = -1;
+  activePpmxY = -1;
+  latestPpmxRawRequestId = 0;
+  clearPpmxRawCache();
+
+  // Restore colormap
+  ppmxColormap = message.ppmxColormap;
+  ppmxColormapSelectEl.value = ppmxColormap;
 
   // Clear caches
   images = [];
@@ -430,6 +551,7 @@ function handleInit(message: { tuples: TupleInfo[]; modalities: string[]; modali
   panX = 0;
   panY = 0;
   isShowingPreview = false;
+  setPointerStatusInfo('');
 
   // Cancel any pending load
   if (loadDebounceTimer !== null) {
@@ -498,7 +620,7 @@ function handleThumbnailError(message: { tupleIndex: number; modalityIndex: numb
   }
 }
 
-function handleImage(message: { tupleIndex: number; modalityIndex: number; dataUrl: string; width: number; height: number }) {
+function handleImage(message: { tupleIndex: number; modalityIndex: number; dataUrl: string; width: number; height: number; isPpmx?: boolean }) {
   const img = new Image();
   img.onload = () => {
     const tupleImages = loadedTuples.get(message.tupleIndex) || [];
@@ -509,7 +631,8 @@ function handleImage(message: { tupleIndex: number; modalityIndex: number; dataU
       name: imageInfo.name,
       modality: imageInfo.modality,
       width: message.width,
-      height: message.height
+      height: message.height,
+      isPpmx: !!message.isPpmx
     };
 
     while (tupleImages.length <= message.modalityIndex) {
@@ -563,6 +686,157 @@ function handleImageError(message: { tupleIndex: number; modalityIndex: number; 
       });
     }
   }
+}
+
+function getCurrentOriginalModalityIndex(): number {
+  return modalityOrder[currentModalityIndex] ?? currentModalityIndex;
+}
+
+function getCurrentPixelPosition(clientX: number, clientY: number): { x: number; y: number } | null {
+  const currentImage = images[currentModalityIndex];
+  if (!currentImage || (currentImage as any).missing) return null;
+
+  const rect = viewerEl.getBoundingClientRect();
+  const carouselOffset = isMultiTupleMode ? CAROUSEL_WIDTH : 0;
+  const vw = rect.width - carouselOffset;
+  const vh = rect.height;
+
+  const baseScale = Math.min(vw / currentImage.width, vh / currentImage.height);
+  const displayScale = baseScale * zoom;
+  const displayW = currentImage.width * displayScale;
+  const displayH = currentImage.height * displayScale;
+
+  const centerX = rect.left + carouselOffset + vw / 2 + panX;
+  const centerY = rect.top + vh / 2 + panY;
+  const left = centerX - displayW / 2;
+  const top = centerY - displayH / 2;
+  const right = left + displayW;
+  const bottom = top + displayH;
+
+  if (clientX < left || clientX > right || clientY < top || clientY > bottom) {
+    return null;
+  }
+
+  const vp = getCurrentViewport();
+  if (!vp) return null;
+
+  const pos = crop.screenToImage(clientX, clientY, vp);
+  const x = Math.max(0, Math.min(currentImage.width - 1, pos.x));
+  const y = Math.max(0, Math.min(currentImage.height - 1, pos.y));
+  return { x, y };
+}
+
+function updatePointerTracker(clientX: number, clientY: number): void {
+  if (crop.cropMode) {
+    setPointerStatusInfo('');
+    return;
+  }
+
+  const currentImage = images[currentModalityIndex];
+  if (!currentImage || (currentImage as any).missing || isShowingPreview) {
+    setPointerStatusInfo('');
+    return;
+  }
+
+  const pixel = getCurrentPixelPosition(clientX, clientY);
+  if (!pixel) {
+    setPointerStatusInfo('');
+    return;
+  }
+
+  const isPpmx = !!currentImage.isPpmx;
+  const x = pixel.x;
+  const y = pixel.y;
+
+  if (isPpmx) {
+    const originalModalityIndex = getCurrentOriginalModalityIndex();
+    const pixelKey = `${currentTupleIndex}:${originalModalityIndex}:${x}:${y}`;
+    activePpmxPixelKey = pixelKey;
+    activePpmxTupleIndex = currentTupleIndex;
+    activePpmxOriginalModalityIndex = originalModalityIndex;
+    activePpmxX = x;
+    activePpmxY = y;
+
+    const rawKey = `${currentTupleIndex}:${originalModalityIndex}`;
+    const cachedRaw = getPpmxRawCacheEntry(rawKey);
+    if (cachedRaw) {
+      const idx = y * cachedRaw.width + x;
+      const value = idx >= 0 && idx < cachedRaw.values.length ? cachedRaw.values[idx] : NaN;
+      if (Number.isFinite(value)) {
+        setPointerStatusInfo(value.toFixed(2));
+      } else {
+        setPointerStatusInfo('(...)');
+      }
+      return;
+    }
+
+    setPointerStatusInfo('(...)');
+    if (!ppmxRawPending.has(rawKey)) {
+      const requestId = ++latestPpmxRawRequestId;
+      ppmxRawPending.set(rawKey, requestId);
+      vscode.postMessage({
+        type: 'requestPpmxRaw',
+        tupleIndex: currentTupleIndex,
+        modalityIndex: originalModalityIndex,
+        requestId
+      });
+    }
+    return;
+  }
+
+  setPointerStatusInfo('');
+}
+
+function handlePixelValue(message: { tupleIndex: number; modalityIndex: number; x: number; y: number; requestId: number; value: number | null }) {
+  if (message.tupleIndex !== currentTupleIndex) return;
+  if (message.modalityIndex !== getCurrentOriginalModalityIndex()) return;
+  const key = `${message.tupleIndex}:${message.modalityIndex}:${message.x}:${message.y}`;
+  if (!activePpmxPixelKey || key !== activePpmxPixelKey) return;
+
+  if (message.value === null) {
+    setPointerStatusInfo('(...)');
+    return;
+  }
+
+  setPointerStatusInfo(message.value.toFixed(2));
+}
+
+function decodeFloat32Base64(valuesBase64: string): Float32Array {
+  const binary = atob(valuesBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return new Float32Array(bytes.buffer);
+}
+
+function handlePpmxRawData(message: { tupleIndex: number; modalityIndex: number; requestId: number; width: number; height: number; valuesBase64: string }) {
+  const cacheKey = `${message.tupleIndex}:${message.modalityIndex}`;
+  const pendingRequestId = ppmxRawPending.get(cacheKey);
+  if (pendingRequestId !== undefined && pendingRequestId !== message.requestId) {
+    return;
+  }
+
+  ppmxRawPending.delete(cacheKey);
+  setPpmxRawCacheEntry(cacheKey, {
+    width: message.width,
+    height: message.height,
+    values: decodeFloat32Base64(message.valuesBase64)
+  });
+
+  if (activePpmxTupleIndex !== message.tupleIndex || activePpmxOriginalModalityIndex !== message.modalityIndex) {
+    return;
+  }
+
+  const idx = activePpmxY * message.width + activePpmxX;
+  const entry = getPpmxRawCacheEntry(cacheKey);
+  if (!entry || idx < 0 || idx >= entry.values.length) {
+    setPointerStatusInfo('(...)');
+    return;
+  }
+
+  const value = entry.values[idx];
+  setPointerStatusInfo(Number.isFinite(value) ? value.toFixed(2) : '(...)');
 }
 
 function showMissingPlaceholder() {
@@ -672,6 +946,8 @@ function handleFileRestored(message: { tupleIndex: number; modalityIndex: number
 }
 
 function handleTupleDeleted(message: { tupleIndex: number }) {
+  clearPpmxRawCache();
+
   // Remove the tuple from our data
   tuples.splice(message.tupleIndex, 1);
   loadedTuples.delete(message.tupleIndex);
@@ -739,6 +1015,8 @@ function handleTupleDeleted(message: { tupleIndex: number }) {
 }
 
 function handleTupleAdded(message: { tuple: TupleInfo; tupleIndex: number }) {
+  clearPpmxRawCache();
+
   // Add the new tuple at the specified index
   tuples.splice(message.tupleIndex, 0, message.tuple);
 
@@ -789,7 +1067,6 @@ function handleTupleAdded(message: { tuple: TupleInfo; tupleIndex: number }) {
 
   // Update multi-tuple mode
   isMultiTupleMode = tuples.length > 1;
-
   // Rebuild carousel and request thumbnail for new tuple
   if (isMultiTupleMode) {
     updateCarouselThumbSize();
@@ -802,6 +1079,8 @@ function handleTupleAdded(message: { tuple: TupleInfo; tupleIndex: number }) {
 }
 
 function handleModalityAdded(message: { modality: string; modalityIndex: number }) {
+  clearPpmxRawCache();
+
   // Insert new modality at the specified index
   modalities.splice(message.modalityIndex, 0, message.modality);
   
@@ -858,6 +1137,8 @@ function handleModalityAdded(message: { modality: string; modalityIndex: number 
 }
 
 function handleModalityRemoved(message: { modalityIndex: number }) {
+  clearPpmxRawCache();
+
   const removedModality = modalities[message.modalityIndex];
   
   // Remove from modalities and colors
@@ -922,6 +1203,7 @@ function loadTuple(index: number) {
   if (index < 0 || index >= tuples.length) return;
 
   currentTupleIndex = index;
+  setPointerStatusInfo('');
 
   // Immediately tell extension which tuple we're on (to cancel stale loads)
   vscode.postMessage({
@@ -1026,7 +1308,7 @@ function showPreviewOrLoading(tupleIndex: number, displayModalityIndex: number) 
         
         // Update status
         const tuple = tuples[tupleIndex];
-        updateStatus(`${tuple.name} | Loading...`, `Zoom: ${zoom.toFixed(1)}x`, tupleIndex);
+        updateStatus(`${tuple.name} | Loading...`, currentZoomInfo(), tupleIndex);
       }
     };
     previewImg.src = thumbnailDataUrl;
@@ -1052,7 +1334,7 @@ function showPreviewOrLoading(tupleIndex: number, displayModalityIndex: number) 
     
     // Update status
     const modalityName = modalities[displayModalityIndex] || 'Image';
-    updateStatus(`${modalityName}: Loading...`, `Zoom: ${zoom.toFixed(1)}x`, tupleIndex);
+    updateStatus(`${modalityName}: Loading...`, currentZoomInfo(), tupleIndex);
   }
   
   // Show spinner
@@ -1277,6 +1559,7 @@ function goToTupleAndModality(tupleIdx: number, modalityIdx: number) {
     if (modalityIdx !== currentModalityIndex) {
       previousModalityIndex = currentModalityIndex;
       currentModalityIndex = modalityIdx;
+      setPointerStatusInfo('');
       render();
       updateCarouselSelection();
     }
@@ -1442,7 +1725,7 @@ function render() {
       // Update status (friendly, not an error)
       // Note: modalities array is already in display order after any reordering
       const modalityName = modalities[currentModalityIndex] || 'Image';
-      updateStatus(`${modalityName}: not available`, `Zoom: ${zoom.toFixed(1)}x`, currentTupleIndex);
+      updateStatus(`${modalityName}: not available`, currentZoomInfo(), currentTupleIndex);
     } else {
       showPreviewOrLoading(currentTupleIndex, currentModalityIndex);
     }
@@ -1458,7 +1741,7 @@ function render() {
   const { img, name, width, height, modality } = currentImage;
 
   // Update status
-  updateStatus(`${name} (${width}×${height})`, `Zoom: ${zoom.toFixed(1)}x`, currentTupleIndex);
+  updateStatus(`${name} (${width}×${height})`, currentZoomInfo(), currentTupleIndex);
 
   // Calculate display size
   const carouselOffset = isMultiTupleMode ? CAROUSEL_WIDTH : 0;
@@ -1706,12 +1989,18 @@ function handleMouseDown(e: MouseEvent) {
 }
 
 function handleMouseMove(e: MouseEvent) {
-  if (crop.cropMode && crop.handleCropMouseMove(e)) return;
-  if (!isDragging) return;
-  panX = e.clientX - dragStartX;
-  panY = e.clientY - dragStartY;
-  isReset = false;
-  render();
+  if (crop.cropMode && crop.handleCropMouseMove(e)) {
+    return;
+  }
+
+  if (isDragging) {
+    panX = e.clientX - dragStartX;
+    panY = e.clientY - dragStartY;
+    isReset = false;
+    render();
+  }
+
+  updatePointerTracker(e.clientX, e.clientY);
 }
 
 function handleMouseUp(e: MouseEvent) {

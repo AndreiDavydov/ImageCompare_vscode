@@ -4,7 +4,7 @@ import * as path from 'path';
 import PptxGenJS from 'pptxgenjs';
 import { scanForImages, readResultsFile, writeResultsFile, mapWinnersToIndices, disambiguateDirectoryNames } from './fileService';
 import { ThumbnailService } from './thumbnailService';
-import { parsePpmx } from './ppmxParser';
+import { parsePpmx, parsePpmxRaw, PpmxOrientationHint } from './ppmxParser';
 import {
   ScanResult,
   TupleInfo,
@@ -13,8 +13,18 @@ import {
   WebViewMessage,
   ExtensionMessage,
   LoadedImage,
-  isImageFile
+  isImageFile,
+  PpmxColormap
 } from './types';
+
+const PPMX_COLORMAPS: PpmxColormap[] = ['grayscale', 'jet'];
+
+function normalizePpmxColormap(value: string | undefined): PpmxColormap {
+  if (value && PPMX_COLORMAPS.includes(value as PpmxColormap)) {
+    return value as PpmxColormap;
+  }
+  return 'grayscale';
+}
 
 /**
  * Info about a recently deleted file (for rename detection)
@@ -24,6 +34,14 @@ interface DeletedFileInfo {
   tupleIndex: number;
   modalityIndex: number;
   timestamp: number;
+}
+
+interface PpmxRawCacheEntry {
+  width: number;
+  height: number;
+  values: Float32Array;
+  mtime: number;
+  orientationKey: string;
 }
 
 /**
@@ -45,6 +63,9 @@ interface PanelState {
   votingEnabled: boolean; // true for mode 1 and 2 (directory-based modes)
   webviewReady: boolean;
   pendingDebugMessages: string[];
+  ppmxColormap: PpmxColormap;
+  ppmxRawCache: Map<string, PpmxRawCacheEntry>;
+  tupleOrientationHints: Map<number, PpmxOrientationHint | null>;
 }
 
 /**
@@ -147,6 +168,8 @@ export class ImageCompareProvider {
 
       // Determine if voting is enabled (mode 1 or mode 2 - directory-based modes)
       const votingEnabled = baseUri !== undefined || modalityDirs.size > 0;
+      const config = vscode.workspace.getConfiguration('imageCompare');
+      const ppmxColormap = normalizePpmxColormap(config.get<string>('ppmxColormap', 'grayscale'));
 
       // Create panel-specific state
       const panelState: PanelState = {
@@ -163,7 +186,10 @@ export class ImageCompareProvider {
         winners: new Map<number, number>(),
         votingEnabled,
         webviewReady: false,
-        pendingDebugMessages: []
+        pendingDebugMessages: [],
+        ppmxColormap,
+        ppmxRawCache: new Map<string, PpmxRawCacheEntry>(),
+        tupleOrientationHints: new Map<number, PpmxOrientationHint | null>()
       };
 
       // Set up file system watcher
@@ -187,6 +213,8 @@ export class ImageCompareProvider {
       panel.onDidDispose(
         () => {
           panelState.loadedImages.clear();
+          panelState.ppmxRawCache.clear();
+          panelState.tupleOrientationHints.clear();
           panelState.fileWatchers.forEach(w => w.dispose());
           panelState.nodeWatchers.forEach(w => w.close());
           if (panelState.deleteCheckTimer) clearInterval(panelState.deleteCheckTimer);
@@ -225,6 +253,14 @@ export class ImageCompareProvider {
         await this.sendImage(state, message.tupleIndex, message.modalityIndex);
         break;
 
+      case 'requestPixelValue':
+        await this.handleRequestPixelValue(state, message.tupleIndex, message.modalityIndex, message.x, message.y, message.requestId);
+        break;
+
+      case 'requestPpmxRaw':
+        await this.handleRequestPpmxRaw(state, message.tupleIndex, message.modalityIndex, message.requestId);
+        break;
+
       case 'navigateTo':
         state.currentTupleIndex = message.tupleIndex;
         // Don't prefetch immediately - wait for tuple to fully load first
@@ -250,6 +286,10 @@ export class ImageCompareProvider {
         await this.handleCropImages(state, message.tupleIndex, message.cropRect, message.srcWidth, message.srcHeight);
         break;
 
+      case 'setPpmxColormap':
+        this.handleSetPpmxColormap(state, message.colormap);
+        break;
+
       case 'deleteTuple':
         await this.handleDeleteTuple(state, message.tupleIndex);
         break;
@@ -261,6 +301,163 @@ export class ImageCompareProvider {
       case 'log':
         // WebView debug messages (disabled in production)
         break;
+    }
+  }
+
+  private async handleRequestPpmxRaw(
+    state: PanelState,
+    tupleIndex: number,
+    modalityIndex: number,
+    requestId: number
+  ): Promise<void> {
+    const tuple = state.scanResult.tuples[tupleIndex];
+    const modality = state.scanResult.modalities[modalityIndex];
+    if (!tuple || !modality) {
+      return;
+    }
+
+    const imageFile = this.findImageForModality(tuple, modality);
+    if (!imageFile || path.extname(imageFile.name).toLowerCase() !== '.ppmx') {
+      return;
+    }
+
+    const raw = await this.getPpmxRawDataForTuple(state, imageFile.uri, tupleIndex);
+    if (!raw) {
+      return;
+    }
+
+    const valueBytes = Buffer.from(raw.values.buffer, raw.values.byteOffset, raw.values.byteLength);
+    const msg: ExtensionMessage = {
+      type: 'ppmxRawData',
+      tupleIndex,
+      modalityIndex,
+      requestId,
+      width: raw.width,
+      height: raw.height,
+      valuesBase64: valueBytes.toString('base64')
+    };
+    state.panel.webview.postMessage(msg);
+  }
+
+  private async handleRequestPixelValue(
+    state: PanelState,
+    tupleIndex: number,
+    modalityIndex: number,
+    x: number,
+    y: number,
+    requestId: number
+  ): Promise<void> {
+    const msgBase = { type: 'pixelValue' as const, tupleIndex, modalityIndex, x, y, requestId };
+    const tuple = state.scanResult.tuples[tupleIndex];
+    const modality = state.scanResult.modalities[modalityIndex];
+    if (!tuple || !modality) {
+      state.panel.webview.postMessage({ ...msgBase, value: null } as ExtensionMessage);
+      return;
+    }
+
+    const imageFile = this.findImageForModality(tuple, modality);
+    if (!imageFile || path.extname(imageFile.name).toLowerCase() !== '.ppmx') {
+      state.panel.webview.postMessage({ ...msgBase, value: null } as ExtensionMessage);
+      return;
+    }
+
+    const raw = await this.getPpmxRawDataForTuple(state, imageFile.uri, tupleIndex);
+    if (!raw) {
+      state.panel.webview.postMessage({ ...msgBase, value: null } as ExtensionMessage);
+      return;
+    }
+
+    const clampedX = Math.max(0, Math.min(raw.width - 1, Math.round(x)));
+    const clampedY = Math.max(0, Math.min(raw.height - 1, Math.round(y)));
+    const idx = clampedY * raw.width + clampedX;
+    const value = idx >= 0 && idx < raw.values.length ? raw.values[idx] : null;
+    const safeValue = typeof value === 'number' && Number.isFinite(value) ? value : null;
+
+    state.panel.webview.postMessage({
+      ...msgBase,
+      x: clampedX,
+      y: clampedY,
+      value: safeValue
+    } as ExtensionMessage);
+  }
+
+  private isPpmxImageFile(imageFile: ImageFile | undefined): boolean {
+    if (!imageFile) return false;
+    return path.extname(imageFile.name).toLowerCase() === '.ppmx';
+  }
+
+  private async getTupleOrientationHint(
+    state: PanelState,
+    tupleIndex: number
+  ): Promise<PpmxOrientationHint | undefined> {
+    if (state.tupleOrientationHints.has(tupleIndex)) {
+      const cached = state.tupleOrientationHints.get(tupleIndex);
+      return cached || undefined;
+    }
+
+    const tuple = state.scanResult.tuples[tupleIndex];
+    if (!tuple) {
+      state.tupleOrientationHints.set(tupleIndex, null);
+      return undefined;
+    }
+
+    for (const imageFile of tuple.images) {
+      if (this.isPpmxImageFile(imageFile)) continue;
+      try {
+        const dims = await this.thumbnailService.getImageDimensions(imageFile.uri);
+        if (dims.width > 0 && dims.height > 0) {
+          const hint = { width: dims.width, height: dims.height };
+          state.tupleOrientationHints.set(tupleIndex, hint);
+          return hint;
+        }
+      } catch {
+        // Ignore and try next non-PPMX modality
+      }
+    }
+
+    state.tupleOrientationHints.set(tupleIndex, null);
+    return undefined;
+  }
+
+  private async getPpmxRawDataForTuple(
+    state: PanelState,
+    uri: vscode.Uri,
+    tupleIndex?: number
+  ): Promise<PpmxRawCacheEntry | null> {
+    const orientationHint = typeof tupleIndex === 'number'
+      ? await this.getTupleOrientationHint(state, tupleIndex)
+      : undefined;
+    const orientationKey = orientationHint
+      ? `${orientationHint.width}x${orientationHint.height}`
+      : 'none';
+
+    const key = `${uri.toString()}|${orientationKey}`;
+    let mtime = 0;
+    try {
+      mtime = (await vscode.workspace.fs.stat(uri)).mtime;
+    } catch {
+      return null;
+    }
+
+    const cached = state.ppmxRawCache.get(key);
+    if (cached && cached.mtime === mtime && cached.orientationKey === orientationKey) {
+      return cached;
+    }
+
+    try {
+      const fileData = await vscode.workspace.fs.readFile(uri);
+      const raw = parsePpmxRaw(Buffer.from(fileData), { orientationHint });
+      const entry: PpmxRawCacheEntry = {
+        width: raw.width,
+        height: raw.height,
+        values: raw.values,
+        mtime,
+        orientationKey
+      };
+      state.ppmxRawCache.set(key, entry);
+      return entry;
+    } catch {
+      return null;
     }
   }
 
@@ -294,6 +491,17 @@ export class ImageCompareProvider {
    * Handle delete tuple request: delete all image files for the given tuple from disk.
    * File watchers will detect the deletions and update the UI.
    */
+  private handleSetPpmxColormap(state: PanelState, colormap: PpmxColormap): void {
+    if (!PPMX_COLORMAPS.includes(colormap)) return;
+    if (state.ppmxColormap === colormap) return;
+    state.ppmxColormap = colormap;
+    state.loadedImages.clear();
+  }
+
+  private getLoadedImageCacheKey(tupleIndex: number, modalityIndex: number, colormap: PpmxColormap): string {
+    return `${tupleIndex}-${modalityIndex}-${colormap}`;
+  }
+
   private async handleDeleteTuple(state: PanelState, tupleIndex: number): Promise<void> {
     const tuple = state.scanResult.tuples[tupleIndex];
     if (!tuple) return;
@@ -362,7 +570,7 @@ export class ImageCompareProvider {
       };
 
       // Helper to load image as base64
-      const loadImageBase64 = async (uri: vscode.Uri): Promise<{ data: string; width: number; height: number } | null> => {
+      const loadImageBase64 = async (uri: vscode.Uri, tupleIndex?: number): Promise<{ data: string; width: number; height: number } | null> => {
         try {
           const bytes = await vscode.workspace.fs.readFile(uri);
           const buffer = Buffer.from(bytes);
@@ -371,7 +579,10 @@ export class ImageCompareProvider {
           if (sharp) {
             let img;
             if (ext === '.ppmx') {
-              const ppmx = parsePpmx(buffer);
+              const orientationHint = typeof tupleIndex === 'number'
+                ? await this.getTupleOrientationHint(state, tupleIndex)
+                : undefined;
+              const ppmx = parsePpmx(buffer, { colormap: state.ppmxColormap, orientationHint });
               img = sharp(ppmx.rgbBuffer, { raw: { width: ppmx.width, height: ppmx.height, channels: 3 } });
             } else {
               img = sharp(buffer);
@@ -478,13 +689,13 @@ export class ImageCompareProvider {
         const cropTuple = state.scanResult.tuples[cropTupleIdx];
         const cropImg = cropTuple.images.find(i => i.modality === modality);
         if (!cropImg) return;
-        const cropImgData = await loadImageBase64(cropImg.uri);
+        const cropImgData = await loadImageBase64(cropImg.uri, cropTupleIdx);
         if (!cropImgData) return;
 
         const fullTuple = state.scanResult.tuples[fullTupleIdx];
         const fullImg = fullTuple.images.find(i => i.modality === modality);
         if (!fullImg) return;
-        const fullImgData = await loadImageBase64(fullImg.uri);
+        const fullImgData = await loadImageBase64(fullImg.uri, fullTupleIdx);
         if (!fullImgData) return;
 
         const cropAspect = cropImgData.width / cropImgData.height;
@@ -551,7 +762,7 @@ export class ImageCompareProvider {
             // (no crops, or crop children are voted separately — they get their own slides)
             const img = tuple.images.find(i => i.modality === modality);
             if (!img) continue;
-            const imgData = await loadImageBase64(img.uri);
+            const imgData = await loadImageBase64(img.uri, tupleIndex);
             if (!imgData) continue;
 
             const slide = pptx.addSlide();
@@ -657,9 +868,12 @@ export class ImageCompareProvider {
     const cropOne = async (imageFile: ImageFile) => {
       const dirUri = vscode.Uri.joinPath(imageFile.uri, '..');
       const outputUri = vscode.Uri.joinPath(dirUri, outputName);
+      const orientationHint = this.isPpmxImageFile(imageFile)
+        ? await this.getTupleOrientationHint(state, tupleIndex)
+        : undefined;
 
       // Scale relative crop rect to this modality's actual dimensions
-      const meta = await this.thumbnailService.getImageDimensions(imageFile.uri);
+      const meta = await this.thumbnailService.getImageDimensions(imageFile.uri, orientationHint);
       const scaledRect = {
         x: Math.max(0, Math.round(relRect.x * meta.width)),
         y: Math.max(0, Math.round(relRect.y * meta.height)),
@@ -671,7 +885,14 @@ export class ImageCompareProvider {
       scaledRect.h = Math.min(scaledRect.h, meta.height - scaledRect.y);
       if (scaledRect.w <= 0 || scaledRect.h <= 0) return;
 
-      const croppedBuffer = await this.thumbnailService.cropImage(imageFile.uri, scaledRect, meta.width, meta.height);
+      const croppedBuffer = await this.thumbnailService.cropImage(
+        imageFile.uri,
+        scaledRect,
+        meta.width,
+        meta.height,
+        state.ppmxColormap,
+        orientationHint
+      );
       await vscode.workspace.fs.writeFile(outputUri, croppedBuffer);
       savedCount++;
       savedPaths.push(outputUri.path);
@@ -867,28 +1088,30 @@ export class ImageCompareProvider {
       modalityPaths,
       config: { thumbnailSize, prefetchCount },
       winners: winnersRecord,
-      votingEnabled: state.votingEnabled
+      votingEnabled: state.votingEnabled,
+      ppmxColormap: state.ppmxColormap
     };
 
     state.panel.webview.postMessage(initMessage);
-    this.generateAllThumbnails(state);
+    void this.generateAllThumbnails(state);
   }
 
   /**
    * Generate thumbnails for all images in background
    */
-  private generateAllThumbnails(state: PanelState): void {
+  private async generateAllThumbnails(state: PanelState): Promise<void> {
     const config = vscode.workspace.getConfiguration('imageCompare');
     const thumbnailSize = config.get<number>('thumbnailSize', 100);
     const allModalities = state.scanResult.modalities;
 
     // Build list of all images to thumbnail (using global modality indices)
-    const items: Array<{ uri: vscode.Uri; tupleIndex: number; modalityIndex: number }> = [];
+    const items: Array<{ uri: vscode.Uri; tupleIndex: number; modalityIndex: number; orientationHint?: PpmxOrientationHint }> = [];
     // Track which slots are missing (no image file)
     const missingSlots: Array<{ tupleIndex: number; modalityIndex: number }> = [];
 
     for (let tupleIndex = 0; tupleIndex < state.scanResult.tuples.length; tupleIndex++) {
       const tuple = state.scanResult.tuples[tupleIndex];
+      const tupleOrientationHint = await this.getTupleOrientationHint(state, tupleIndex);
       
       for (let modalityIndex = 0; modalityIndex < allModalities.length; modalityIndex++) {
         const modality = allModalities[modalityIndex];
@@ -898,7 +1121,8 @@ export class ImageCompareProvider {
           items.push({
             uri: imageFile.uri,
             tupleIndex,
-            modalityIndex
+            modalityIndex,
+            orientationHint: this.isPpmxImageFile(imageFile) ? tupleOrientationHint : undefined
           });
         } else {
           // Mark as missing - will send error immediately
@@ -916,6 +1140,7 @@ export class ImageCompareProvider {
     this.thumbnailService.queueThumbnails(
       items,
       thumbnailSize * 2, // Generate at 2x for retina
+      state.ppmxColormap,
       (tupleIndex, modalityIndex, dataUrl) => {
         this.sendThumbnailMessage(state, tupleIndex, modalityIndex, dataUrl);
       },
@@ -952,7 +1177,15 @@ export class ImageCompareProvider {
         }
         
         try {
-          const dataUrl = await this.thumbnailService.getThumbnail(imageFile.uri, thumbnailSize * 2);
+          const orientationHint = this.isPpmxImageFile(imageFile)
+            ? await this.getTupleOrientationHint(state, tupleIndex)
+            : undefined;
+          const dataUrl = await this.thumbnailService.getThumbnail(
+            imageFile.uri,
+            thumbnailSize * 2,
+            state.ppmxColormap,
+            orientationHint
+          );
           this.sendThumbnailMessage(state, tupleIndex, modalityIndex, dataUrl);
         } catch (error) {
           const message = error instanceof Error ? error.message : 'Unknown error';
@@ -966,18 +1199,23 @@ export class ImageCompareProvider {
    * Send a full image to the webview
    */
   private async sendImage(state: PanelState, tupleIndex: number, modalityIndex: number): Promise<void> {
-    const cacheKey = `${tupleIndex}-${modalityIndex}`;
+    const cacheKey = this.getLoadedImageCacheKey(tupleIndex, modalityIndex, state.ppmxColormap);
 
     // Check cache first
     if (state.loadedImages.has(cacheKey)) {
       const cached = state.loadedImages.get(cacheKey)!;
+      const tuple = state.scanResult.tuples[tupleIndex];
+      const modality = state.scanResult.modalities[modalityIndex];
+      const imageFile = tuple ? this.findImageForModality(tuple, modality) : undefined;
+      const isPpmx = !!imageFile && path.extname(imageFile.name).toLowerCase() === '.ppmx';
       const msg: ExtensionMessage = {
         type: 'image',
         tupleIndex,
         modalityIndex,
         dataUrl: cached.dataUrl,
         width: cached.width,
-        height: cached.height
+        height: cached.height,
+        isPpmx
       };
       state.panel.webview.postMessage(msg);
       return;
@@ -1005,8 +1243,16 @@ export class ImageCompareProvider {
     }
 
     try {
-      const { dataUrl, width, height } = await this.thumbnailService.loadFullImage(imageFile.uri);
+      const orientationHint = this.isPpmxImageFile(imageFile)
+        ? await this.getTupleOrientationHint(state, tupleIndex)
+        : undefined;
+      const { dataUrl, width, height } = await this.thumbnailService.loadFullImage(
+        imageFile.uri,
+        state.ppmxColormap,
+        orientationHint
+      );
       state.loadedImages.set(cacheKey, { dataUrl, width, height });
+      const isPpmx = path.extname(imageFile.name).toLowerCase() === '.ppmx';
 
       if (tupleIndex === state.currentTupleIndex) {
         const msg: ExtensionMessage = {
@@ -1015,7 +1261,8 @@ export class ImageCompareProvider {
           modalityIndex,
           dataUrl,
           width,
-          height
+          height,
+          isPpmx
         };
         state.panel.webview.postMessage(msg);
       }
@@ -1049,7 +1296,7 @@ export class ImageCompareProvider {
         if (tupleIndex >= 0 && tupleIndex < state.scanResult.tuples.length) {
           // Iterate over all modalities (using global indices)
           for (let modalityIndex = 0; modalityIndex < allModalities.length; modalityIndex++) {
-            const cacheKey = `${tupleIndex}-${modalityIndex}`;
+            const cacheKey = this.getLoadedImageCacheKey(tupleIndex, modalityIndex, state.ppmxColormap);
             if (!state.loadedImages.has(cacheKey)) {
               // Load in background (don't await)
               this.loadImageToCache(state, tupleIndex, modalityIndex);
@@ -1067,7 +1314,7 @@ export class ImageCompareProvider {
    * Load an image into cache without sending to webview
    */
   private async loadImageToCache(state: PanelState, tupleIndex: number, modalityIndex: number): Promise<void> {
-    const cacheKey = `${tupleIndex}-${modalityIndex}`;
+    const cacheKey = this.getLoadedImageCacheKey(tupleIndex, modalityIndex, state.ppmxColormap);
     if (state.loadedImages.has(cacheKey)) return;
 
     const tuple = state.scanResult.tuples[tupleIndex];
@@ -1077,7 +1324,14 @@ export class ImageCompareProvider {
     if (!imageFile) return;
 
     try {
-      const { dataUrl, width, height } = await this.thumbnailService.loadFullImage(imageFile.uri);
+      const orientationHint = this.isPpmxImageFile(imageFile)
+        ? await this.getTupleOrientationHint(state, tupleIndex)
+        : undefined;
+      const { dataUrl, width, height } = await this.thumbnailService.loadFullImage(
+        imageFile.uri,
+        state.ppmxColormap,
+        orientationHint
+      );
       state.loadedImages.set(cacheKey, { dataUrl, width, height });
     } catch {
       // Silently fail for prefetch
@@ -1272,8 +1526,37 @@ body {
 }
 #fp-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   justify-content: flex-end;
+}
+#show-zoom-wrap {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--vscode-foreground, #ddd);
+}
+#show-zoom-wrap input {
+  margin: 0;
+}
+#ppmx-colormap-wrap {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--vscode-foreground, #ddd);
+}
+#ppmx-colormap-select {
+  flex: 1;
+  font-size: 11px;
+  background: var(--vscode-dropdown-background, #3c3c3c);
+  color: var(--vscode-dropdown-foreground, #ccc);
+  border: 1px solid var(--vscode-dropdown-border, #555);
+  border-radius: 3px;
+  padding: 1px 2px;
 }
 #crop-btn {
   padding: 3px 8px;
@@ -1684,6 +1967,17 @@ body {
           <div id="thumb-viewport"></div>
         </div>
         <div id="fp-actions">
+          <label id="show-zoom-wrap" title="Show zoom in the status bar">
+            <input id="show-zoom-toggle" type="checkbox" checked />
+            Show zoom
+          </label>
+          <div id="ppmx-colormap-wrap" title="Colormap for PPMX depth images">
+            <span>Colormap:</span>
+            <select id="ppmx-colormap-select">
+              <option value="grayscale">Grayscale</option>
+              <option value="jet">Jet</option>
+            </select>
+          </div>
           <button id="crop-btn" title="Crop all modalities (C)">Crop</button>
           <button id="delete-btn" title="Delete current tuple files (Del)">Delete</button>
           <button id="pptx-btn" title="Export voted tuples to PPTX">PPTX</button>
@@ -1868,6 +2162,8 @@ body {
    * Handle a file being deleted
    */
   private handleFileDeleted(state: PanelState, uri: vscode.Uri): void {
+    state.ppmxRawCache.clear();
+    state.tupleOrientationHints.clear();
     const uriStr = uri.toString();
 
     // Skip if already being processed (avoids duplicate detection from polling + watcher)
@@ -1983,6 +2279,7 @@ body {
    */
   private removeTuple(state: PanelState, tupleIndex: number): void {
     state.scanResult.tuples.splice(tupleIndex, 1);
+    state.tupleOrientationHints.clear();
 
     // Re-index loadedImages cache
     const newLoadedImages = new Map<string, LoadedImage>();
@@ -2052,6 +2349,7 @@ body {
    */
   private async removeModality(state: PanelState, modalityIndex: number): Promise<void> {
     const modality = state.scanResult.modalities[modalityIndex];
+    state.tupleOrientationHints.clear();
 
     // Remove from modalities list
     state.scanResult.modalities.splice(modalityIndex, 1);
@@ -2097,6 +2395,8 @@ body {
    * Handle a file being created (could be new file, rename, or restoration)
    */
   private handleFileCreated(state: PanelState, uri: vscode.Uri): void {
+    state.ppmxRawCache.clear();
+    state.tupleOrientationHints.clear();
     // Check if this is an image file
     const filename = uri.path.split('/').pop() || '';
     if (!isImageFile(filename)) return;
@@ -2467,6 +2767,7 @@ body {
    * Returns the new modality index, or -1 on failure
    */
   private async addNewModality(state: PanelState, modalityName: string): Promise<number> {
+    state.tupleOrientationHints.clear();
     // Add to modalities list (sorted alphabetically to maintain order)
     const modalities = state.scanResult.modalities;
 
@@ -2534,6 +2835,8 @@ body {
    * Handle a file content change (re-load the image)
    */
   private handleFileChanged(state: PanelState, uri: vscode.Uri): void {
+    state.ppmxRawCache.clear();
+    state.tupleOrientationHints.clear();
     const uriStr = uri.toString();
     
     // Find which tuple/modality this file belongs to
@@ -2582,7 +2885,15 @@ body {
     const imageFile = tuple.images[modalityIndex];
     
     try {
-      const dataUrl = await this.thumbnailService.getThumbnail(imageFile.uri, thumbnailSize * 2);
+      const orientationHint = this.isPpmxImageFile(imageFile)
+        ? await this.getTupleOrientationHint(state, tupleIndex)
+        : undefined;
+      const dataUrl = await this.thumbnailService.getThumbnail(
+        imageFile.uri,
+        thumbnailSize * 2,
+        state.ppmxColormap,
+        orientationHint
+      );
       this.sendThumbnailMessage(state, tupleIndex, modalityIndex, dataUrl);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Unknown error';
