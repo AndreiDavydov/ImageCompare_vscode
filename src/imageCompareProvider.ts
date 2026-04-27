@@ -502,6 +502,15 @@ export class ImageCompareProvider {
     return `${tupleIndex}-${modalityIndex}-${colormap}`;
   }
 
+  private clearLoadedImageCacheForSlot(state: PanelState, tupleIndex: number, modalityIndex: number): void {
+    const keyPrefix = `${tupleIndex}-${modalityIndex}-`;
+    for (const key of Array.from(state.loadedImages.keys())) {
+      if (key.startsWith(keyPrefix)) {
+        state.loadedImages.delete(key);
+      }
+    }
+  }
+
   private async handleDeleteTuple(state: PanelState, tupleIndex: number): Promise<void> {
     const tuple = state.scanResult.tuples[tupleIndex];
     if (!tuple) return;
@@ -2210,8 +2219,7 @@ body {
           });
 
           // Remove from loaded images cache
-          const cacheKey = `${tupleIndex}-${globalModIdx}`;
-          state.loadedImages.delete(cacheKey);
+          this.clearLoadedImageCacheForSlot(state, tupleIndex, globalModIdx);
 
           // Wait a short time to see if this is a rename (create will follow quickly)
           setTimeout(() => {
@@ -2409,8 +2417,7 @@ body {
       const { tupleIndex, modalityIndex } = restoredSlot;
       
       // Clear cached data
-      const cacheKey = `${tupleIndex}-${modalityIndex}`;
-      state.loadedImages.delete(cacheKey);
+      this.clearLoadedImageCacheForSlot(state, tupleIndex, modalityIndex);
       
       // Generate new thumbnail
       this.regenerateThumbnail(state, tupleIndex, modalityIndex);
@@ -2453,8 +2460,7 @@ body {
       );
       
       // Clear old cached data and reload
-      const cacheKey = `${tupleIndex}-${modalityIndex}`;
-      state.loadedImages.delete(cacheKey);
+      this.clearLoadedImageCacheForSlot(state, tupleIndex, modalityIndex);
       
       // Generate new thumbnail
       this.regenerateThumbnail(state, tupleIndex, modalityIndex);
@@ -2665,8 +2671,7 @@ body {
       );
 
       // Regenerate thumbnail
-      const newModalityIndex = tuple.images.findIndex(img => img.uri.toString() === uri.toString());
-      this.regenerateThumbnail(state, matchingTupleIndex, newModalityIndex);
+      this.regenerateThumbnail(state, matchingTupleIndex, modalityIndex);
 
       // Notify webview that the slot is now filled (so it can re-render / clear spinner)
       // Include imageInfo so the webview can update its tuple data if the slot was unknown
@@ -2842,22 +2847,24 @@ body {
     // Find which tuple/modality this file belongs to
     for (let tupleIndex = 0; tupleIndex < state.scanResult.tuples.length; tupleIndex++) {
       const tuple = state.scanResult.tuples[tupleIndex];
-      for (let modalityIndex = 0; modalityIndex < tuple.images.length; modalityIndex++) {
-        if (tuple.images[modalityIndex].uri.toString() === uriStr) {
-          // Clear cached data
-          const cacheKey = `${tupleIndex}-${modalityIndex}`;
-          state.loadedImages.delete(cacheKey);
-          
-          // Regenerate thumbnail
-          this.regenerateThumbnail(state, tupleIndex, modalityIndex);
-          
-          // If currently viewing this image, reload it
-          if (tupleIndex === state.currentTupleIndex) {
-            this.sendImage(state, tupleIndex, modalityIndex);
-          }
-          
-          return;
+      for (const imageFile of tuple.images) {
+        if (imageFile.uri.toString() !== uriStr) continue;
+
+        const globalModalityIndex = state.scanResult.modalities.indexOf(imageFile.modality);
+        if (globalModalityIndex < 0) return;
+
+        // Clear cached data
+        this.clearLoadedImageCacheForSlot(state, tupleIndex, globalModalityIndex);
+
+        // Regenerate thumbnail
+        this.regenerateThumbnail(state, tupleIndex, globalModalityIndex);
+
+        // If currently viewing this image, reload it
+        if (tupleIndex === state.currentTupleIndex) {
+          this.sendImage(state, tupleIndex, globalModalityIndex);
         }
+
+        return;
       }
     }
   }
@@ -2880,9 +2887,14 @@ body {
     const thumbnailSize = config.get<number>('thumbnailSize', 100);
     
     const tuple = state.scanResult.tuples[tupleIndex];
-    if (!tuple || !tuple.images[modalityIndex]) return;
-    
-    const imageFile = tuple.images[modalityIndex];
+    const modality = state.scanResult.modalities[modalityIndex];
+    if (!tuple || !modality) return;
+
+    const imageFile = this.findImageForModality(tuple, modality);
+    if (!imageFile) {
+      this.sendThumbnailErrorMessage(state, tupleIndex, modalityIndex, 'Image not available');
+      return;
+    }
     
     try {
       const orientationHint = this.isPpmxImageFile(imageFile)
